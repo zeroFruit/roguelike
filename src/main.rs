@@ -39,6 +39,61 @@ const FOV_ALGO: FovAlgorithm = FovAlgorithm::Basic;
 const FOV_LIGHT_WALLS: bool = true;
 const TORCH_RADIUS: i32 = 5;
 
+const MAX_ROOM_MONSTERS: i32 = 3;
+
+// player will always be the first object
+const PLAYER: usize = 0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DeathCallback {
+    Player,
+    Monster,
+}
+
+impl DeathCallback {
+    fn callback(self, object: &mut Object) {
+        use DeathCallback::*;
+        
+        let callback: fn(&mut Object) = match self {
+            Player => player_death,
+            Monster => monster_death,
+        };
+        callback(object);
+    }
+}
+
+fn player_death(player: &mut Object) {
+    println!("You died!");
+
+    // for added effect, transform the player into a corpse!
+    player.char = '%';
+    player.color = colors::DARK_RED;
+}
+
+fn monster_death(monster: &mut Object) {
+    // transform it into a nasty corpse! it doesn't block, can't be
+    // attacked and doesn't move
+    println!("{} is dead!", monster.name);
+    monster.char = '%';
+    monster.color = colors::DARK_RED;
+    monster.blocks = false;
+    monster.fighter = None;
+    monster.ai = None;
+    monster.name = format!("remains of {}", monster.name);
+}
+
+// combat-related properties and methods (monster, player, NPC).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fighter {
+    max_hp: i32,
+    hp: i32,
+    defense: i32,
+    power: i32,
+    on_death: DeathCallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Ai;
 
 // This is a generic object: the player, a monster, an item, the stairs...
 // It's always represented by a character on screen.
@@ -48,16 +103,24 @@ struct Object {
     y: i32,
     char: char,
     color: Color,
+    name: String,
+    blocks: bool,
+    alive: bool,
+    fighter: Option<Fighter>,
+    ai: Option<Ai>,
 }
 impl Object {
-    pub fn new(x: i32, y: i32, char: char, color: Color) -> Self {
-        Object { x, y, char, color }
-    }
-
-    pub fn move_by(&mut self, dx: i32, dy: i32, map: &Map) {
-        if !map[(self.x + dx) as usize][(self.y + dy) as usize].blocked {
-            self.x += dx;
-            self.y += dy;    
+    pub fn new(x: i32, y: i32, char: char, name: &str, color: Color, blocks: bool) -> Self {
+        Object {
+            x: x,
+            y: y,
+            char: char,
+            color: color,
+            name: name.into(),
+            blocks: blocks,
+            alive: false,
+            fighter: None,
+            ai: None,
         }
     }
 
@@ -65,6 +128,143 @@ impl Object {
     pub fn draw(&self, con: &mut Console) {
         con.set_default_foreground(self.color);
         con.put_char(self.x, self.y, self.char, BackgroundFlag::None);
+    }
+
+    pub fn pos(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+
+    pub fn set_pos(&mut self, x: i32, y: i32) {
+        self.x = x;
+        self.y = y;
+    }
+
+    // return the distance to another object
+    pub fn distance_to(&self, other: &Object) -> f32 {
+        let dx = other.x - self.x;
+        let dy = other.y - self.y;
+
+        ((dx.pow(2) + dy.pow(2)) as f32).sqrt()
+    }
+
+    pub fn take_damage(&mut self, damage: i32) {
+        // apply damage if possible
+        if let Some(fighter) = self.fighter.as_mut() {
+            if damage > 0 {
+                fighter.hp -= damage;
+            }
+        }
+
+        // check for death, call the death function
+        if let Some(fighter) = self.fighter {
+            if fighter.hp <= 0 {
+                self.alive = false;
+                fighter.on_death.callback(self);
+            }
+        }
+    }
+
+    pub fn attack(&mut self, target: &mut Object) {
+        // a simple formula for attack damage
+        let damage = self.fighter.map_or(0, |f| f.power) - target.fighter.map_or(0, |f| f.defense);
+        if damage > 0 {
+            // make the target take some damage
+            println!(
+                "{} attacks {} for {} hit points",
+                self.name, target.name, damage
+            );
+            target.take_damage(damage);
+        } else {
+            println!(
+                "{} attacks {} but it has no effect!",
+                self.name, target.name
+            );
+        }
+    }
+}
+
+fn move_by(id: usize, dx: i32, dy: i32, map: &Map, objects: &mut [Object]) {
+        let (x, y) = objects[id].pos();
+        if !is_blocked(x + dx, y + dy, map, objects) {
+            objects[id].set_pos(x + dx, y + dy);
+        }
+    }
+
+fn is_blocked(x: i32, y: i32, map: &Map, objects: &[Object]) -> bool {
+    // first test the map tile
+    if map[x as usize][y as usize].blocked {
+        return true;
+    }
+
+    // now check for any blocking objects
+    objects.iter().any(|object| {
+        object.blocks && object.pos() == (x, y)
+    })
+}
+
+fn player_move_or_attack(dx: i32, dy: i32, map: &Map, objects: &mut [Object]) {
+    // the coordinates the player is moving to/attacking
+    let x = objects[PLAYER].x + dx;
+    let y = objects[PLAYER].y + dy;
+
+    // try to find an attackable object there
+    let target_id = objects
+        .iter()
+        .position(|object| object.fighter.is_some() && object.pos() == (x, y));
+    
+    // attack if target found, move otherwise
+    match target_id {
+        Some(target_id) => {
+            let (player, target) = mut_two(PLAYER, target_id, objects);
+            player.attack(target);
+        }
+        None => {
+            move_by(PLAYER, dx, dy, map, objects);
+        }
+    }
+}
+
+fn move_towards(id: usize, target_x: i32, target_y: i32, map: &Map, objects: &mut [Object]) {
+    // vector from this object to the target and distance
+    let dx = target_x - objects[id].x;
+    let dy = target_y - objects[id].y;
+    let distance = ((dx.pow(2) + dy.pow(2)) as f32).sqrt();
+
+    // normalize it to length 1 (preserving direction), then round it and
+    // convert to integer so the movement is restricted to the map grid
+    let dx = (dx as f32 / distance).round() as i32;
+    let dy = (dy as f32 / distance).round() as i32;
+    move_by(id, dx, dy, map, objects);
+}
+
+fn ai_take_turn(monster_id: usize, map: &Map, objects: &mut [Object], fov_map: &FovMap) {
+    // a basic monster takes its turn. If you can see it, it can see you
+    let (monster_x, monster_y) = objects[monster_id].pos();
+    
+    if fov_map.is_in_fov(monster_x, monster_y) {
+        if objects[monster_id].distance_to(&objects[PLAYER]) >= 2.0 {
+            // move towards if far away
+            let (player_x, player_y) = objects[PLAYER].pos();
+            move_towards(monster_id, player_x, player_y, map, objects);
+        } else if objects[PLAYER].fighter.map_or(false, |f| f.hp > 0) {
+            // close enough, attack! (if the player is still alive.)
+            let (monster, player) = mut_two(monster_id, PLAYER, objects);
+            monster.attack(player);
+        }
+    }
+}
+
+// Mutably borrow two *separate* elements from the given slice.
+// Panics when the indexes are equal or out of bounds.
+fn mut_two<T>(first_index: usize, second_index: usize, items: &mut [T]) -> (&mut T, &mut T) {
+    assert!(first_index != second_index);
+
+    let split_at_index = cmp::max(first_index, second_index);
+    let (first_slice, second_slice) = items.split_at_mut(split_at_index);
+    if first_index < second_index {
+        (&mut first_slice[first_index], &mut second_slice[0])
+    } else {
+        (&mut second_slice[0], &mut first_slice[second_index])
     }
 }
 
@@ -125,15 +325,62 @@ impl Rect {
     }
 }
 
+fn place_objects(room: Rect, map: &Map, objects: &mut Vec<Object>) {
+    // choose random number of monsters
+    let num_monsters = rand::thread_rng().gen_range(0, MAX_ROOM_MONSTERS + 1);
+
+    for _ in 0..num_monsters {
+        // choose random spot for this monster
+        let x = rand::thread_rng().gen_range(room.x1 + 1, room.x2);
+        let y = rand::thread_rng().gen_range(room.y1 + 1, room.y2);
+
+        // only place it if the tile is not blocked
+        if !is_blocked(x, y, map, objects) {
+            let mut monster = if rand::random::<f32>() < 0.8 {
+                // create an orc
+                let mut orc = Object::new(x, y, 'o', "orc", colors::DESATURATED_GREEN, true);
+                orc.fighter = Some(Fighter {
+                    max_hp: 10,
+                    hp: 10,
+                    defense: 0,
+                    power: 3,
+                    on_death: DeathCallback::Monster
+                });
+                orc.ai = Some(Ai);
+                orc
+            } else {
+                let mut troll = Object::new(x, y, 'T', "troll", colors::DARKER_GREEN, true);
+                troll.fighter = Some(Fighter {
+                    max_hp: 16,
+                    hp: 16,
+                    defense: 1,
+                    power: 4,
+                    on_death: DeathCallback::Monster
+                });
+                troll.ai = Some(Ai);
+                troll
+            };
+
+            monster.alive = true;
+            objects.push(monster);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PlayerAction {
+    TookTurn,
+    DidntTakeTurn,
+    Exit,
+}
+
 type Map = Vec<Vec<Tile>>;
 
-fn make_map() -> (Map, (i32, i32)) {
+fn make_map(objects: &mut Vec<Object>) -> Map {
     // fill map with "blocked" tiles
     let mut map = vec![vec![Tile::wall(); MAP_HEIGHT as usize]; MAP_WIDTH as usize];
 
     let mut rooms = vec![];
-
-    let mut starting_position = (0, 0);
 
     for _ in 0..MAX_ROOMS {
         // random width and height
@@ -155,12 +402,16 @@ fn make_map() -> (Map, (i32, i32)) {
             // "paint" it to the map's tiles
             create_room(new_room, &mut map);
 
+            // add some content to this room, such as monsters
+            place_objects(new_room, &mut map, objects);
+
             // center coordinates of the new room, will be useful later
             let (new_x, new_y) = new_room.center();
 
             if rooms.is_empty() {
                 // this is the first room, where the player starts at
-                starting_position = (new_x, new_y);
+                objects[PLAYER].set_pos(new_x, new_y);
+
             } else {
                 // all rooms after the first:
                 // connect it to the previous room with a tunnel
@@ -182,7 +433,7 @@ fn make_map() -> (Map, (i32, i32)) {
         }
     }
 
-    (map, starting_position)
+    map
 }
 
 fn create_h_tunnel(x1: i32, x2: i32, y: i32, map: &mut Map) {
@@ -244,11 +495,27 @@ fn render_all(
         }
     }
 
+    let mut to_draw: Vec<_> = objects
+        .iter()
+        .filter(|o| fov_map.is_in_fov(o.x, o.y))
+        .collect();
+    // sort so that non-blocking objects come first
+    to_draw.sort_by(|o1, o2| o1.blocks.cmp(&o2.blocks));
     // draw all objects in the list
-    for object in objects {
-        if fov_map.is_in_fov(object.x, object.y) {
-            object.draw(con);
-        }
+    for object in &to_draw {
+        object.draw(con);
+    }
+
+    // show the player's stats
+    root.set_default_foreground(colors::WHITE);
+    if let Some(fighter) = objects[PLAYER].fighter {
+        root.print_ex(
+            1, 
+            SCREEN_HEIGHT - 2, 
+            BackgroundFlag::None, 
+            TextAlignment::Left, 
+            format!("HP: {}/{} ", fighter.hp, fighter.max_hp)
+        );
     }
 
     // blit the contents of "con" to the root console and present it
@@ -263,31 +530,49 @@ fn render_all(
     );
 } 
 
-fn handle_keys(root: &mut Root, player: &mut Object, map: &Map) -> bool {
+fn handle_keys(root: &mut Root, map: &Map, objects: &mut [Object]) -> PlayerAction {
     use tcod::input::Key;
     use tcod::input::KeyCode::*;
 
+    use PlayerAction::*;
+
     let key = root.wait_for_keypress(true);
-    match key {
-        Key {
-            code: Enter,
-            alt: true,
-            ..
-        } => {
+    let player_alive = objects[PLAYER].alive;
+    match (key, player_alive) {
+        (
+            Key {
+                code: Enter,
+                alt: true,
+                ..
+            },
+            _,
+        )
+         => {
             // Alt+Enter toggle fullscreen
             let fullscreen = root.is_fullscreen();
             root.set_fullscreen(!fullscreen);
+            DidntTakeTurn
         },
-        Key {code: Escape, .. } => return true, // exit game
-        Key {code: Up, .. } => player.move_by(0, -1, map),
-        Key {code: Down, .. } => player.move_by(0, 1, map),
-        Key {code: Left, .. } => player.move_by(-1, 0, map),
-        Key {code: Right, .. } => player.move_by(1, 0, map),
+        (Key {code: Escape, .. }, _) => return Exit, // exit game
+        (Key {code: Up, .. }, true) => {
+            player_move_or_attack(0, -1, map, objects);
+            TookTurn
+        },
+        (Key {code: Down, .. }, true) => {
+            player_move_or_attack(0, 1, map, objects);
+            TookTurn
+        },
+        (Key {code: Left, .. }, true) => {
+            player_move_or_attack(-1, 0, map, objects);
+            TookTurn
+        },
+        (Key {code: Right, .. }, true) => {
+            player_move_or_attack(1, 0, map, objects);
+            TookTurn
+        },
 
-        _ => {},
+        _ => DidntTakeTurn,
     }
-
-    false
 }
 
 fn main() {
@@ -301,18 +586,23 @@ fn main() {
 
     let mut con = Offscreen::new(SCREEN_WIDTH, SCREEN_HEIGHT);
 
-    // generate map (at this point it's not drawn to the screen)
-    let (mut map, (player_x, player_y)) = make_map();
-
     // create object representing the player
     // place the player inside the first room
-    let player = Object::new(player_x, player_y, '@', colors::WHITE);
+    let mut player = Object::new(0, 0, '@', "player", colors::WHITE, true);
+    player.alive = true;
+    player.fighter = Some(Fighter {
+        max_hp: 30,
+        hp: 30,
+        defense: 2,
+        power: 5,
+        on_death: DeathCallback::Player,
+    });
 
-    // create an NPC
-    let npc = Object::new(SCREEN_WIDTH / 2 - 5, SCREEN_HEIGHT / 2, '@', colors::YELLOW);
+    // the list of objects with just the player
+    let mut objects = vec![player];
 
-    // the list of objects with those two
-    let mut objects = [player, npc];
+    // generate map (at this point it's not drawn to the screen)
+    let mut map = make_map(&mut objects);
 
     // create the FOV map, according to the generated map
     let mut fov_map = FovMap::new(MAP_WIDTH, MAP_HEIGHT);
@@ -347,13 +637,22 @@ fn main() {
         root.flush();
         
         // handle keys and exist game if needed
-        let player = &mut objects[0];
+        let player = &mut objects[PLAYER];
 
         previous_player_position = (player.x, player.y);
 
-        let exit = handle_keys(&mut root, player, &map);
-        if exit {
+        let player_action = handle_keys(&mut root, &map, &mut objects);
+        if player_action == PlayerAction::Exit {
             break;
+        }
+
+        // let monsters take their turn
+        if objects[PLAYER].alive && player_action != PlayerAction::DidntTakeTurn {
+            for id in 0..objects.len() {
+                if objects[id].ai.is_some() {
+                    ai_take_turn(id, &map, &mut objects, &fov_map);
+                }
+            }
         }
     }
 }
